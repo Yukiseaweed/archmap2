@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>GSIジオコーダで重複判定（単純版）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html,body{height:100%;margin:0}
+    #map{height:100vh}
+    .panel{position:absolute;top:10px;left:10px;z-index:1000;background:#fff;opacity:.96;
+      padding:10px 12px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);max-width:560px;font-size:14px}
+    .panel h1{font-size:16px;margin:0 0 6px}
+    .panel .small{font-size:12px;color:#444}
+    .panel details{margin-top:6px}
+    .fail{color:#b00020}
+    ol{max-height:26vh;overflow:auto;margin:6px 0 0 18px}
+    ul{max-height:26vh;overflow:auto;margin:6px 0 0 18px}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eee;margin-left:6px}
+    .btn{margin-top:6px;padding:6px 10px;border:1px solid #ccc;border-radius:8px;background:#f7f7f7;cursor:pointer}
+    .selected{background:#fff3cd;border-radius:6px;padding:2px 4px}
+  </style>
+</head>
+<body>
+<div class="panel">
+  <h1>重複判定（GSI住所検索） <span class="badge" id="count">0/0</span></h1>
+  <div class="small">※ 同一座標判定は <b>小数6桁</b>で固定（約0.11m）。失敗した住所は赤表示。</div>
+  <button class="btn" id="locBtn">現在地を表示</button>
+  <details open>
+    <summary>住所リスト（店舗名付き）</summary>
+    <ol id="addrList"></ol>
+  </details>
+  <details open>
+    <summary>重複グループ（同一座標）</summary>
+    <ul id="dups"></ul>
+  </details>
+  <div class="small" id="status">読み込み中…</div>
+</div>
+<div id="map"></div>
+
+<script>
+  // ====== 入力（店舗名 + 住所）— 13件 ======
+  const stores = [
+    { name: "本社",                 addr: "神奈川県横浜市旭区二俣川1-45-69 荻原ビル2階" },
+    { name: "レコードブック二俣川店", addr: "神奈川県横浜市旭区本村町44番地１ シャンテール１階" },
+    { name: "レコードブック西谷店",   addr: "神奈川県横浜市保土ケ谷区西谷4-1-7" },
+    { name: "レコードブック希望が丘店", addr: "神奈川県横浜市旭区中希望ヶ丘93-13 メゾンドエミー1F" },
+    { name: "レコードブック三ツ境店", addr: "神奈川県横浜市旭区笹野台1-32-10 G・C・アネックス1F" },
+    { name: "レコードブック南万騎が原店", addr: "神奈川県横浜市旭区柏町36番地15 柏ハーモニビル1F" },
+    { name: "レコードブック泉店",     addr: "神奈川県横浜市泉区和泉町5732-1 いずみ野ハイツ101号" },
+    { name: "レコードブック戸塚店",   addr: "神奈川県横浜市泉区中田東1丁目34-23 1F" },
+    { name: "レコードブック六会店",   addr: "神奈川県藤沢市亀井野3-1-1 ヒルサイド湘南1F" },
+    { name: "レコードブック川井店",   addr: "神奈川県横浜市旭区川井本町109-2" },
+    { name: "レコードブック成瀬店",   addr: "東京都町田市南成瀬2-7-1" },
+    { name: "レコードブック大口店",   addr: "神奈川県横浜市神奈川区大口通21番 ポートマンション大口一番館" },
+    { name: "レコードブック川崎千年店", addr: "神奈川県川崎市高津区千年552-1 ウィズKYH1F" }
+  ];
+
+  // 軽い正規化
+  const normalize = s => s
+    .replace(/横浜市横浜市/g,'横浜市')
+    .replace(/神奈川県神奈川県/g,'神奈川県')
+    .replace(/\s+/g,' ')
+    .trim();
+
+  const addresses = stores.map(s => normalize(s.addr));
+  const queries   = addresses.map(a => a.split(' ')[0]); // 建物名を落として検索
+
+  // ====== 現在地だけオレンジのピン（SVGアイコン） ======
+  const orangePinSvg =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="48" viewBox="0 0 32 48">'+
+      '<path d="M16 0C7.163 0 0 7.163 0 16c0 8.94 16 32 16 32s16-23.06 16-32C32 7.163 24.837 0 16 0z" fill="#FF8C00"/>'+
+      '<circle cx="16" cy="16" r="5" fill="#fff"/></svg>';
+  const orangeIcon = L.icon({
+    iconUrl: 'data:image/svg+xml;utf8,' + encodeURIComponent(orangePinSvg),
+    iconSize: [32,48],
+    iconAnchor: [16,48],
+    popupAnchor: [0,-42]
+  });
+
+  // Leaflet 初期化
+  const map = L.map('map').setView([35.466,139.622],11);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    maxZoom:19, attribution:'&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  L.control.scale().addTo(map);
+
+  // UI refs
+  const listEl = document.getElementById('addrList');
+  const dupsEl = document.getElementById('dups');
+  const statusEl = document.getElementById('status');
+  const countEl = document.getElementById('count');
+  const locBtn = document.getElementById('locBtn');
+
+  // リスト（店舗名 + 住所）
+  stores.forEach((s,i)=>{
+    const li=document.createElement('li');
+    li.innerHTML = `<b>${i+1}. ${s.name}</b> — ${addresses[i]}`;
+    li.id='addr-'+(i+1);
+    listEl.appendChild(li);
+  });
+
+  // GSI 検索
+  async function geocodeGSI(q){
+    const res = await fetch("https://msearch.gsi.go.jp/address-search/AddressSearch?q="+encodeURIComponent(q));
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    if(!Array.isArray(data)||data.length===0) throw new Error('not found');
+    const [lon,lat] = data[0].geometry.coordinates;
+    return {lat,lon};
+  }
+
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  const bounds = L.latLngBounds();
+  const points = []; // {idx, name, addr, lat, lon, marker, _blinkId}
+  let done=0, fails=0;
+
+  (async ()=>{
+    countEl.textContent = `0/${addresses.length}`;
+    for(let i=0;i<addresses.length;i++){
+      const idx=i+1;
+      try{
+        const {lat,lon} = await geocodeGSI(queries[i]);
+        // 店舗は既定の青ピン（icon指定なし）
+        const marker = L.marker([lat,lon]).addTo(map)
+          .bindPopup(`<b>${idx}. ${stores[i].name}</b><br>${addresses[i]}`);
+        points.push({idx, name:stores[i].name, addr:addresses[i], lat, lon, marker, _blinkId:null});
+        bounds.extend([lat,lon]);
+
+        // マーカー→リストの相互同期（マーカークリックでリスト強調）
+        marker.on('click', ()=>{
+          highlightList(idx);
+        });
+
+      }catch(e){
+        document.getElementById('addr-'+idx)?.classList.add('fail');
+        fails++;
+      }finally{
+        done++; countEl.textContent = `${done}/${addresses.length}`;
+        await sleep(180);
+      }
+    }
+    if(bounds.isValid()) map.fitBounds(bounds.pad(0.2));
+
+    // === リスト→マップ同期（タップで点滅＆ポップアップ） ===
+    for(let i=0;i<addresses.length;i++){
+      const idx=i+1;
+      const el=document.getElementById('addr-'+idx);
+      const handler=(ev)=>{
+        ev.preventDefault();
+        focusMarker(idx);
+      };
+      el.addEventListener('click', handler);
+      el.addEventListener('touchstart', handler, {passive:true});
+    }
+
+    // === 重複判定（小数6桁で同一点扱い） ===
+    const keyOf = (p)=> `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`;
+    const groups = new Map();
+    for(const p of points){
+      const k = keyOf(p);
+      if(!groups.has(k)) groups.set(k,[]);
+      groups.get(k).push(p);
+    }
+    let dupCount=0;
+    for(const [k,arr] of groups){
+      if(arr.length<=1) continue;
+      dupCount++;
+      const li=document.createElement('li');
+      li.innerHTML = `<b>${k}</b> に <b>${arr.length}</b> 件:<br>` +
+        arr.map(p=>`${p.idx}. ${p.name} — ${p.addr}`).join('<br>');
+      dupsEl.appendChild(li);
+    }
+    statusEl.textContent = (dupCount>0)
+      ? `完了：重複グループ ${dupCount} 件。失敗 ${fails} 件。`
+      : `完了：重複なし。失敗 ${fails} 件。`;
+  })();
+
+  // ====== 現在地表示（現在地のみオレンジ／輪っかなし） ======
+  let myLayer = L.layerGroup().addTo(map);
+  locBtn.addEventListener('click', ()=>{
+    if(!navigator.geolocation){
+      statusEl.textContent = "現在地：このブラウザはGeolocation非対応";
+      return;
+    }
+    statusEl.textContent = "現在地：測位中…";
+    navigator.geolocation.getCurrentPosition(pos=>{
+      myLayer.clearLayers();
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      L.marker([lat,lon], {icon: orangeIcon})
+        .addTo(myLayer)
+        .bindPopup("<b>現在地</b>")
+        .openPopup();
+      map.flyTo([lat,lon], 16);
+      statusEl.textContent = "現在地：取得成功";
+    }, err=>{
+      statusEl.textContent = "現在地：取得失敗（権限や環境を確認）";
+    }, {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+  });
+
+  // ====== 補助関数 ======
+  function getPoint(idx){ return points.find(p=>p.idx===idx); }
+
+  function highlightList(idx){
+    // 選択表示を更新
+    for(const li of listEl.querySelectorAll('li')) li.classList.remove('selected');
+    document.getElementById('addr-'+idx)?.classList.add('selected');
+    // スクロール
+    document.getElementById('addr-'+idx)?.scrollIntoView({block:'nearest', behavior:'smooth'});
+  }
+
+  function blinkMarker(p, times=3, interval=180){
+    // 既存ブリンクを停止
+    if(p._blinkId){ clearInterval(p._blinkId); p._blinkId=null; p.marker.setOpacity(1); }
+    let toggles = times*2; // on/offで2トグル=1回
+    p._blinkId = setInterval(()=>{
+      const next = (p.marker.options.opacity===1 || p.marker.options.opacity===undefined) ? 0.25 : 1;
+      p.marker.setOpacity(next);
+      if(--toggles<=0){
+        clearInterval(p._blinkId);
+        p._blinkId=null;
+        p.marker.setOpacity(1);
+      }
+    }, interval);
+  }
+
+  function focusMarker(idx){
+    const p = getPoint(idx);
+    if(!p){ statusEl.textContent = "まだ位置取得中…"; return; }
+    highlightList(idx);
+    map.flyTo([p.lat,p.lon], 16);
+    p.marker.openPopup();
+    blinkMarker(p, 3, 180);
+  }
+</script>
+</body>
+</html>
